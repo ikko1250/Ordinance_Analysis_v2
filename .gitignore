@@ -1,3 +1,5 @@
 *.html
 *.db
 *.json
+*.csv
+/.playwright-mcp

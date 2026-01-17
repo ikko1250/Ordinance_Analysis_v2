@@ -5,21 +5,79 @@
 
 import sqlite3
 import re
+import csv
+import unicodedata
 from bs4 import BeautifulSoup
 from typing import List, Dict, Tuple
 import json
 
 class OrdinanceParser:
-    def __init__(self, html_file: str, db_file: str = "data/ordinance_data.db"):
+    def __init__(
+        self,
+        html_file: str,
+        db_file: str = "data/ordinance_data.db",
+        municipality_list_file: str = "data/地方自治体リスト.csv",
+    ):
         self.html_file = html_file
         self.db_file = db_file
+        self.municipality_list_file = municipality_list_file
         self.conn = None
         self.cursor = None
+        self._municipality_full_map = {}
+        self._municipality_name_map = {}
+        self._prefecture_name_map = {}
+        self._prefecture_municipalities = {}
+        self._prefecture_name_list = []
+        self._load_municipality_list()
 
     def connect_db(self):
         """データベース接続"""
         self.conn = sqlite3.connect(self.db_file)
         self.cursor = self.conn.cursor()
+
+    def _normalize_municipality_text(self, text: str) -> str:
+        """自治体名を検索用に正規化"""
+        if not text:
+            return ""
+        text = unicodedata.normalize("NFKC", text)
+        text = re.sub(r"\s+", "", text)
+        return text.replace("ヶ", "ケ").replace("ヵ", "カ")
+
+    def _load_municipality_list(self):
+        """地方自治体リストを読み込んで検索用インデックスを作成"""
+        with open(self.municipality_list_file, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                prefecture = (row.get("都道府県名（漢字）") or "").strip()
+                municipality = (row.get("市区町村名（漢字）") or "").strip()
+                if not prefecture:
+                    continue
+
+                normalized_prefecture = self._normalize_municipality_text(prefecture)
+                self._prefecture_name_map.setdefault(normalized_prefecture, prefecture)
+
+                if not municipality:
+                    continue
+
+                normalized_municipality = self._normalize_municipality_text(municipality)
+                full_name = prefecture + municipality
+                normalized_full_name = self._normalize_municipality_text(full_name)
+
+                self._municipality_full_map.setdefault(
+                    normalized_full_name, (prefecture, municipality)
+                )
+                self._municipality_name_map.setdefault(normalized_municipality, []).append(
+                    (prefecture, municipality)
+                )
+                self._prefecture_municipalities.setdefault(prefecture, {})[
+                    normalized_municipality
+                ] = municipality
+
+        self._prefecture_name_list = sorted(
+            self._prefecture_name_map.items(),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
 
     def create_tables(self):
         """テーブル作成"""
@@ -117,17 +175,46 @@ class OrdinanceParser:
 
     def extract_municipality_info(self, municipality_text: str) -> Tuple[str, str]:
         """自治体名から都道府県と市区町村を分離"""
-        # 都道府県パターン
+        normalized_text = self._normalize_municipality_text(municipality_text)
+
+        # 1) 都道府県+市区町村の完全一致
+        full_match = self._municipality_full_map.get(normalized_text)
+        if full_match:
+            return full_match
+
+        # 2) 都道府県名が先頭にある場合は自治体リストで補正
+        for normalized_prefecture, prefecture in self._prefecture_name_list:
+            if normalized_text.startswith(normalized_prefecture):
+                municipality_part = normalized_text[len(normalized_prefecture):]
+                municipality_map = self._prefecture_municipalities.get(prefecture, {})
+                if municipality_part:
+                    municipality = municipality_map.get(municipality_part)
+                    if municipality:
+                        return prefecture, municipality
+
+                # リストにない場合は元の文字列から分離
+                if municipality_text.startswith(prefecture):
+                    remainder = municipality_text[len(prefecture):]
+                else:
+                    remainder = municipality_text.replace(prefecture, "", 1)
+                return prefecture, remainder or municipality_text
+
+        # 3) 市区町村名のみの一致（政令指定都市など）
+        municipality_matches = self._municipality_name_map.get(normalized_text)
+        if municipality_matches:
+            if len(municipality_matches) == 1:
+                return municipality_matches[0]
+
+        # 4) フォールバック: 正規表現で分離
         prefecture_pattern = r"(^(.+?都|.+?府|.+?道|.+?県))"
         match = re.search(prefecture_pattern, municipality_text)
-
         if match:
             prefecture = match.group(1)
             municipality = municipality_text.replace(prefecture, "", 1)
             return prefecture, municipality
-        else:
-            # 都道府県が見つからない場合（例：政令指定都市等）
-            return "不明", municipality_text
+
+        # 都道府県が見つからない場合（例：政令指定都市等）
+        return "不明", municipality_text
 
     def parse_html(self) -> List[Dict]:
         """HTMLファイルをパース"""
