@@ -12,6 +12,19 @@ from typing import List, Dict, Tuple
 import json
 
 class OrdinanceParser:
+    # 47都道府県のリスト（長い順にソート）
+    PREFECTURES = [
+        "東京都", "北海道", "大阪府", "京都府",
+        "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+        "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "神奈川県",
+        "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県",
+        "岐阜県", "静岡県", "愛知県", "三重県", "滋賀県", "兵庫県",
+        "奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県",
+        "山口県", "徳島県", "香川県", "愛媛県", "高知県", "福岡県",
+        "佐賀県", "長崎県", "熊本県", "大分県", "宮崎県", "鹿児島県",
+        "沖縄県",
+    ]
+
     def __init__(
         self,
         html_file: str,
@@ -23,11 +36,7 @@ class OrdinanceParser:
         self.municipality_list_file = municipality_list_file
         self.conn = None
         self.cursor = None
-        self._municipality_full_map = {}
         self._municipality_name_map = {}
-        self._prefecture_name_map = {}
-        self._prefecture_municipalities = {}
-        self._prefecture_name_list = []
         self._load_municipality_list()
 
     def connect_db(self):
@@ -50,34 +59,13 @@ class OrdinanceParser:
             for row in reader:
                 prefecture = (row.get("都道府県名（漢字）") or "").strip()
                 municipality = (row.get("市区町村名（漢字）") or "").strip()
-                if not prefecture:
-                    continue
-
-                normalized_prefecture = self._normalize_municipality_text(prefecture)
-                self._prefecture_name_map.setdefault(normalized_prefecture, prefecture)
-
-                if not municipality:
+                if not prefecture or not municipality:
                     continue
 
                 normalized_municipality = self._normalize_municipality_text(municipality)
-                full_name = prefecture + municipality
-                normalized_full_name = self._normalize_municipality_text(full_name)
-
-                self._municipality_full_map.setdefault(
-                    normalized_full_name, (prefecture, municipality)
-                )
                 self._municipality_name_map.setdefault(normalized_municipality, []).append(
                     (prefecture, municipality)
                 )
-                self._prefecture_municipalities.setdefault(prefecture, {})[
-                    normalized_municipality
-                ] = municipality
-
-        self._prefecture_name_list = sorted(
-            self._prefecture_name_map.items(),
-            key=lambda item: len(item[0]),
-            reverse=True,
-        )
 
     def create_tables(self):
         """テーブル作成"""
@@ -173,47 +161,32 @@ class OrdinanceParser:
 
         return date_str
 
+    def _parse_date_with_review(self, date_str: str) -> Tuple[str, bool]:
+        """日付を標準化し、要レビュー判定を返す"""
+        if not date_str:
+            return None, False
+
+        normalized = date_str.strip()
+        standardized = self.parse_date_to_standard_format(normalized)
+        if standardized == normalized and re.search(r"(平成|令和|\d+年|\d+月|\d+日|公布|施行)", normalized):
+            return standardized, True
+        return standardized, False
+
     def extract_municipality_info(self, municipality_text: str) -> Tuple[str, str]:
         """自治体名から都道府県と市区町村を分離"""
+        # 1) 都道府県名を先頭から完全一致で検索
+        for prefecture in self.PREFECTURES:
+            if municipality_text.startswith(prefecture):
+                municipality = municipality_text[len(prefecture):]
+                return prefecture, municipality
+
+        # 2) 市区町村名のみの場合（政令指定都市など）
         normalized_text = self._normalize_municipality_text(municipality_text)
-
-        # 1) 都道府県+市区町村の完全一致
-        full_match = self._municipality_full_map.get(normalized_text)
-        if full_match:
-            return full_match
-
-        # 2) 都道府県名が先頭にある場合は自治体リストで補正
-        for normalized_prefecture, prefecture in self._prefecture_name_list:
-            if normalized_text.startswith(normalized_prefecture):
-                municipality_part = normalized_text[len(normalized_prefecture):]
-                municipality_map = self._prefecture_municipalities.get(prefecture, {})
-                if municipality_part:
-                    municipality = municipality_map.get(municipality_part)
-                    if municipality:
-                        return prefecture, municipality
-
-                # リストにない場合は元の文字列から分離
-                if municipality_text.startswith(prefecture):
-                    remainder = municipality_text[len(prefecture):]
-                else:
-                    remainder = municipality_text.replace(prefecture, "", 1)
-                return prefecture, remainder or municipality_text
-
-        # 3) 市区町村名のみの一致（政令指定都市など）
         municipality_matches = self._municipality_name_map.get(normalized_text)
-        if municipality_matches:
-            if len(municipality_matches) == 1:
-                return municipality_matches[0]
+        if municipality_matches and len(municipality_matches) == 1:
+            return municipality_matches[0]
 
-        # 4) フォールバック: 正規表現で分離
-        prefecture_pattern = r"(^(.+?都|.+?府|.+?道|.+?県))"
-        match = re.search(prefecture_pattern, municipality_text)
-        if match:
-            prefecture = match.group(1)
-            municipality = municipality_text.replace(prefecture, "", 1)
-            return prefecture, municipality
-
-        # 都道府県が見つからない場合（例：政令指定都市等）
+        # 3) 都道府県が見つからない場合
         return "不明", municipality_text
 
     def parse_html(self) -> List[Dict]:
@@ -258,6 +231,16 @@ class OrdinanceParser:
                                 # 自治体情報
                                 municipality_text = cells[0].get_text(strip=True)
                                 prefecture, municipality = self.extract_municipality_info(municipality_text)
+                                review_reasons = set()
+                                if not current_enactment_year:
+                                    review_reasons.add("missing_enactment_year")
+                                if prefecture == "不明":
+                                    normalized_text = self._normalize_municipality_text(municipality_text)
+                                    municipality_matches = self._municipality_name_map.get(normalized_text)
+                                    if municipality_matches and len(municipality_matches) > 1:
+                                        review_reasons.add("ambiguous_municipality")
+                                    else:
+                                        review_reasons.add("unknown_prefecture")
 
                                 # 条例名とURL
                                 ordinance_name = ""
@@ -275,7 +258,9 @@ class OrdinanceParser:
 
                                 # 公布日
                                 promulgation_text = cells[2].get_text(strip=True)
-                                promulgation_date = self.parse_date_to_standard_format(promulgation_text)
+                                promulgation_date, needs_review = self._parse_date_with_review(promulgation_text)
+                                if needs_review:
+                                    review_reasons.add("unparsed_promulgation_date")
 
                                 # 施行日
                                 implementation_dates = []
@@ -283,12 +268,24 @@ class OrdinanceParser:
 
                                 # セル内のテキスト（pタグ以外も含む）を処理
                                 for impl_text in impl_cell.stripped_strings:
-                                    impl_date = self.parse_date_to_standard_format(impl_text)
+                                    impl_date, needs_review = self._parse_date_with_review(impl_text)
+                                    if needs_review:
+                                        review_reasons.add("unparsed_implementation_date")
                                     description = "初回施行" if "改正" not in impl_text else "改正施行"
                                     implementation_dates.append({
                                         'date': impl_date,
                                         'description': description
                                     })
+
+                                review_needed = bool(review_reasons)
+                                if review_needed:
+                                    reasons = ", ".join(sorted(review_reasons))
+                                    print(
+                                        "WARNING: review needed - "
+                                        f"reasons=[{reasons}] "
+                                        f"municipality='{municipality_text}' "
+                                        f"ordinance='{ordinance_name}'"
+                                    )
 
                                 # データを保存
                                 ordinance_data.append({
@@ -298,7 +295,10 @@ class OrdinanceParser:
                                     'url': url,
                                     'enactment_year': current_enactment_year,
                                     'promulgation_date': promulgation_date,
-                                    'implementation_dates': implementation_dates
+                                    'implementation_dates': implementation_dates,
+                                    'review_needed': review_needed,
+                                    'review_reasons': sorted(review_reasons),
+                                    'post_review_instruction': ""
                                 })
                                 print(f"Processed: {prefecture} {municipality}")
 

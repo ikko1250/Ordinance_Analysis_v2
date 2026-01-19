@@ -1,5 +1,6 @@
-*.html
-*.db
-*.json
-*.csv
+/data
 /.playwright-mcp
+/asset
+/.venv
+/.claude
+ordinance_names.csv
