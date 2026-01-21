@@ -36,7 +36,7 @@ def normalize_name(name):
     return normalized.replace("ヶ", "ケ").replace("ヵ", "ケ")
 
 
-def build_prefecture_prefixes(prefecture_names):
+def build_prefecture_prefixes(plqrefecture_names):
     suffixes = ("都", "道", "府", "県")
     prefix_info = {}
     for name in prefecture_names:

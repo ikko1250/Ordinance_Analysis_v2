@@ -3,4 +3,7 @@
 /asset
 /.venv
 /.claude
+/out_db
+/out_pdf_db
+/output_similarity
 ordinance_names.csv
